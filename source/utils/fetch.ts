@@ -2,6 +2,9 @@ import * as path from 'path';
 import got from '../utils/got';
 import { DiskFastq } from 'disk-fastq';
 import { RecurrenceRule, scheduleJob } from 'node-schedule';
+import * as Sentry from '@sentry/node';
+import { RewriteFrames } from '@sentry/integrations';
+
 import logger, { logHttpError } from './logger';
 import { findFeed, getNewItems } from './feed';
 import { config } from '../config';
@@ -14,8 +17,7 @@ import {
     failAttempt,
     getFeedByUrl,
     updateFeed,
-    handleRedirect,
-    updateFeedUrl
+    handleRedirect
 } from '../proxies/rss-feed';
 import {
     Messager,
@@ -35,19 +37,6 @@ function nextFetchTimeStr(minutes: number) {
         .replace('T', ' ');
 }
 
-function gotBugWorkaround(req) {
-    req.prependOnceListener('cacheableResponse', (cacheableResponse) => {
-        const fix = () => {
-            if (!cacheableResponse.req) {
-                return;
-            }
-            cacheableResponse.complete = cacheableResponse.req.res.complete;
-        };
-        cacheableResponse.prependOnceListener('end', fix);
-        fix();
-    });
-}
-
 async function handleErr(e: Messager, feed: Feed): Promise<void> {
     logger.info(`${feed.feed_title} ${feed.url}`, 'ERROR_MANY_TIME');
     const message: ErrorMaxTimeMessage = {
@@ -57,21 +46,24 @@ async function handleErr(e: Messager, feed: Feed): Promise<void> {
         feed
     };
     process.send && process.send(message);
-    const { origin } = new URL(feed.url);
-    const res = await got(origin);
-    const newUrl = await findFeed(res.body, origin);
-    delete res.body;
-    delete res.rawBody;
-    if (newUrl.length > 0) {
-        updateFeedUrl(feed.url, newUrl[0]);
-        const message: ChangeFeedUrlMessage = {
-            success: false,
-            message: 'CHANGE',
-            new_feed: newUrl,
-            err: { message: e.message },
-            feed: feed
-        };
-        process.send(message);
+    try {
+        const { origin } = new URL(feed.url);
+        const res = await got(origin);
+        const text = await res.textConverted();
+        const newUrl = await findFeed(text, origin);
+        if (newUrl.length > 0) {
+            await handleRedirect(feed.url, newUrl[0]);
+            const message: ChangeFeedUrlMessage = {
+                success: false,
+                message: 'CHANGE',
+                new_feed: newUrl,
+                err: { message: e.message },
+                feed: feed
+            };
+            process.send(message);
+        }
+    } catch (err) {
+        logger.error(`handlerError: ${err.stack ?? err.message}`);
     }
 }
 
@@ -80,17 +72,15 @@ async function fetch(feedModal: Feed): Promise<Option<any[]>> {
     try {
         logger.debug(`fetching ${feedUrl}`);
         const requestUrl = encodeUrl(feedUrl);
-        const request = got.get(requestUrl, {
+        const request = got(requestUrl, {
             headers: {
                 'If-None-Match': feedModal.etag_header,
                 'If-Modified-Since': feedModal.last_modified_header
             }
         });
-        if (config.http_cache) {
-            request.on('request', gotBugWorkaround);
-        }
+
         const res = await request;
-        if (res.statusCode === 304) {
+        if (res.status === 304) {
             const updatedFeedModal: Partial<Feed> & { feed_id: number } = {
                 feed_id: feedModal.feed_id,
                 error_count: 0,
@@ -101,10 +91,11 @@ async function fetch(feedModal: Feed): Promise<Option<any[]>> {
             updateFeed(updatedFeedModal);
             return none;
         }
-        if (requestUrl !== res.url && res.statusCode === 301) {
+        if (requestUrl !== res.url && res.status === 301) {
             await handleRedirect(feedUrl, res.url);
         }
-        const feed = await parseString(res.body);
+        const text = await res.textConverted();
+        const feed = await parseString(text);
         const items = feed.items;
         const ttlMinutes =
             typeof feed.ttl === 'number' && !Number.isNaN(feed.ttl)
@@ -121,13 +112,11 @@ async function fetch(feedModal: Feed): Promise<Option<any[]>> {
         if (!Number.isNaN(feed.ttl) && feed.ttl !== feedModal.ttl) {
             updatedFeedModal.ttl = feed.ttl;
         }
-        if (res.headers['last-modified'] !== feedModal.last_modified_header) {
-            updatedFeedModal.last_modified_header =
-                res.headers['last-modified'];
+        const lastModifiedHeader = res.headers.get('last-modified');
+        if (lastModifiedHeader !== feedModal.last_modified_header) {
+            updatedFeedModal.last_modified_header = lastModifiedHeader;
         }
-        const etag = Array.isArray(res.headers['etag'])
-            ? res.headers['etag'][0]
-            : res.headers['etag'];
+        const etag = res.headers.get('etag');
         if (etag !== feedModal.etag_header) {
             updatedFeedModal.etag_header = etag || '';
         }
@@ -182,7 +171,6 @@ const queue = new DiskFastq<never, Feed>(
     (err, sendItems, feed) => {
         if (sendItems && !err) {
             process.send &&
-                sendItems &&
                 process.send({
                     success: true,
                     sendItems: sendItems.slice(0, item_num),
@@ -226,6 +214,18 @@ function gc() {
     );
     setTimeout(gc, 3 * 60 * 1000);
 }
+
+if (config.sentry_dsn) {
+    Sentry.init({
+        dsn: config.sentry_dsn,
+        integrations: [
+            new RewriteFrames({
+                root: config['PKG_ROOT']
+            })
+        ],
+        tracesSampleRate: 0.5
+    });
+}
 gc();
 run();
 const rule = new RecurrenceRule();
@@ -249,10 +249,16 @@ switch (unit) {
 }
 
 scheduleJob(rule, run);
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error(`Unhandled Rejection at: ${promise} reason: ${reason}`);
+});
 process.on('SIGUSR2', () => {
     logger.info(
         `worker queue length: ${queue.fastq.length()}, ${
             queue.queue.remainCount
         } => ${queue.length} Running: ${(queue.fastq as any).running()}`
     );
+});
+process.on('disconnect', () => {
+    process.exit();
 });

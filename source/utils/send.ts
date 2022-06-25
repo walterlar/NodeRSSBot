@@ -5,7 +5,7 @@ import {
 import logger from './logger';
 import sanitize from './sanitize';
 import { config } from '../config';
-import Telegraf, { Context } from 'telegraf';
+import { Telegraf, Context } from 'telegraf';
 import { Feed, FeedItem } from '../types/feed';
 import { getUserById, migrateUser } from '../proxies/users';
 import { isNone, isSome } from '../types/option';
@@ -83,7 +83,7 @@ const send = async (
                     disable_web_page_preview: true
                 });
             } catch (e) {
-                const resend = handlerSendError(e, userId);
+                const resend = await handlerSendError(e, userId);
                 if (resend && e.parameters?.migrate_to_chat_id) {
                     await bot.telegram.sendMessage(
                         e.parameters.migrate_to_chat_id,

@@ -2,13 +2,16 @@ import errors from '../utils/errors';
 import got from '../utils/got';
 import { getFeedByUrl, sub } from '../proxies/rss-feed';
 import i18n from '../i18n';
-import { MContext, Next } from '../types/ctx';
+import { AddMessageKey, MContext, TNextFn } from '../types/ctx';
 import { isSome } from '../types/option';
 import { Feed } from '../types/feed';
 import { parseString } from '../parser/parse';
 import { decodeUrl, encodeUrl } from '../utils/urlencode';
 
-export default async (ctx: MContext, next: Next): Promise<void> => {
+export default async (
+    ctx: MContext & AddMessageKey<'text', string>,
+    next: TNextFn
+): Promise<void> => {
     const urls = ctx.message.text.match(
         /(((https?:(?:\/\/)?)(?:[-;:&=+$,\w]+@)?[A-Za-z0-9.-]+|(?:www\.|[-;:&=+$,\w]+@)[A-Za-z0-9.-]+)((?:\/[+~%/.\w\-_]*)?\??(?:[-+=&;%@.\w_]*)#?(?:[.!/\\\w]*))?)/gm
     );
@@ -21,9 +24,9 @@ export default async (ctx: MContext, next: Next): Promise<void> => {
                 return feed.value;
             } else {
                 try {
-                    const res = await got.get(encodeUrl(url));
-                    const rssFeed = await parseString(res.body);
-                    // const rssFeed = await parser.parseString(res.body);
+                    const res = await got(encodeUrl(url));
+                    const text = await res.textConverted();
+                    const rssFeed = await parseString(text);
                     return {
                         feed_title: rssFeed.title,
                         url,
